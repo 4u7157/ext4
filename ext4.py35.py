@@ -1,8 +1,13 @@
+#!/usr/bin/env python3
+
 import ctypes
 import functools
 import io
 import math
 import queue
+import argparse
+import sys
+import os
 
 
 
@@ -848,6 +853,8 @@ class Inode:
         except KeyError:
             device_type = "?"
 
+        inode_uid = self.inode.i_uid
+        inode_gid = self.inode.i_gid
         return "".join([
             device_type,
 
@@ -862,6 +869,8 @@ class Inode:
             "r" if (self.inode.i_mode & ext4_inode.S_IROTH) != 0 else "-",
             "w" if (self.inode.i_mode & ext4_inode.S_IWOTH) != 0 else "-",
             special_flag("t", (self.inode.i_mode & ext4_inode.S_IXOTH) != 0, (self.inode.i_mode & ext4_inode.S_ISVTX) != 0),
+            f" {inode_uid}",
+            f" {inode_gid}",
         ])
 
     def open_dir (self, decode_name = None):
@@ -1198,3 +1207,76 @@ class Tools:
                 file_type = file_type,
                 file_type_str = file_types[file_type] if file_type in file_types else "?"
             ))
+
+parser = argparse.ArgumentParser(description='Read <modes, symlinks, contexts and capabilities> from an ext4 image')
+parser.add_argument('ext4_image', help='Path to ext4 image to process')
+args = parser.parse_args()
+exists = os.path.isfile(args.ext4_image)
+if not exists:
+    print("Error: input file " f"[{args.ext4_image}]" " was not found")
+    sys.exit(1)
+
+file = open(args.ext4_image, "rb")
+volume = Volume(file)
+
+def scan_dir (root_inode, root_path = ""):
+    for entry_name, entry_inode_idx, entry_type in root_inode.open_dir():
+        if entry_name == "." or entry_name == "..":
+            continue
+        entry_inode = root_inode.volume.get_inode(entry_inode_idx)
+        entry_inode_path = root_path + "/" + entry_name
+        if entry_inode.is_dir:
+            scan_dir(entry_inode, entry_inode_path)
+        if entry_inode_path[-1] == '/':
+            continue
+        xattrs_perms = list(entry_inode.xattrs())
+        found_cap = False
+        found_con = False
+        if "security.capability" in f"{xattrs_perms}": found_cap = True
+        if "security.selinux" in f"{xattrs_perms}": found_con = True
+        contexts = ""
+        capability = ", \"capabilities\", 0x0"
+        if found_cap:
+            if found_con:
+                capability = f"{xattrs_perms[1:2]}"
+            else:
+                capability = f"{xattrs_perms[0:1]}"
+            capability = capability.split(" ")[1][:-3][+2:].encode('utf-8').decode('unicode-escape').encode('ISO-8859-1')
+            capability = hex(int.from_bytes(capability[4:8] + capability[14:18], "little"))
+            capability = ", \"capabilities\", " f"{capability}"
+            capability = f"{capability}"
+        if found_con:
+            contexts = f"{xattrs_perms[0:1]}"
+            contexts = f"{contexts.split( )[1].split('x00')[0][:-1][+2:]}"
+            contexts = f"{contexts}"
+        permissions = perm(entry_inode.mode_str.split( )[0])
+        usergroup = entry_inode.mode_str.split( )[1].rjust(1, '0') + ", \"gid\", " + entry_inode.mode_str.split( )[2].rjust(1, '0')
+        filefolder = ''.join(entry_inode_path.split('/', 1))
+        print("set_metadata(\""f"{filefolder}" "\", \"uid\", " f"{usergroup}" ", \"mode\", " f"{permissions}" f"{capability}" ", \"selabel\", \"" f"{contexts}" "\");")
+
+def perm(var):
+    switcher = {
+    "----------": "0000",
+    "drwx------": "0700",
+    "-rw-r--r--": "0644",
+    "lrw-r--r--": "0644",
+    "drwxr-xr-x": "0755",
+    "-rwxr-xr-x": "0755",
+    "lrwxr-xr-x": "0755",
+    "-r-xr-x---": "0550",
+    "-rwx------": "0700",
+    "-rwxr-x---": "0750",
+    "-rw-------": "0600",
+    "-r-xr-xr-x": "0555",
+    "-r--r--r--": "0444",
+    "lrwxr-x---": "0750",
+    "dr-xr-xr-x": "0555",
+    "drwxrwx--x": "0771",
+    "drwxrwx---": "0770",
+    "lrw-------": "0600",
+    "drwxr-x--x": "0751",
+    "drwxr-x---": "0750"}
+    return switcher.get(var,"0644")
+
+scan_dir(volume.root)
+file.close()
